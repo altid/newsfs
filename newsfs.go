@@ -61,6 +61,10 @@ func main() {
 	ctrl.SetCommands(Commands...)
 	ctrl.CreateBuffer("main", "feed")
 
+	if conf.Sleep < 1 {
+		log.Fatal("Sub-hour timeouts for fetching new feeds is unsupported")
+	}
+
 	if e := s.setup(ctrl, conf.Feeds); e != nil {
 		log.Fatal(e)
 	}

@@ -55,7 +55,7 @@ func (s *server) Run(ctrl *fs.Control, cmd *fs.Command) error {
 
 		return ioutil.WriteFile(s.feeds, after, 0644)
 	default:
-		fmt.Errorf("%s not supported", cmd.Args[0])
+		return fmt.Errorf("%s not supported", cmd.Args[0])
 	}
 
 	return nil
@@ -68,14 +68,35 @@ func (s *server) setup(ctrl *fs.Control, feeds string) error {
 	s.feeds = feeds
 	s.ctrl = ctrl
 	s.run = make(chan struct{})
+	s.last = make(map[string]time.Time)
 
+	return s.populate()
+}
+
+func (s *server) populate() error {
+	ctx := s.ctrl.Context()
+
+	ew, err := s.ctrl.ErrorWriter()
+	if err != nil {
+		return err
+	}
+
+	fp, err := os.Open(s.feeds)
+	if err != nil {
+		return err
+	}
+
+	for feed := range listOldFeeds(ctx, bufio.NewReader(fp), ew) {
+		if e := s.writeFeeds(feed); e != nil {
+			fmt.Fprintf(ew, "%v\n", e)
+		}
+	}
+
+	fp.Close()
 	return nil
 }
 
 func (s *server) listen(timeout int) {
-	s.last = make(map[string]time.Time)
-	p := gofeed.NewParser()
-
 	ew, err := s.ctrl.ErrorWriter()
 	if err != nil {
 		log.Fatal(err)
@@ -83,12 +104,67 @@ func (s *server) listen(timeout int) {
 
 	defer ew.Close()
 
-	if e := listen(s, ew, p, timeout); e != nil {
+	if e := listen(s, ew, timeout); e != nil {
 		log.Fatal(e)
 	}
 }
 
-func listen(s *server, ew io.Writer, p *gofeed.Parser, timeout int) error {
+func (s *server) writeFeeds(feed *gofeed.Feed) error {
+	// Oddly, we can only check for nillable feeds
+	// here and not in find. Oh well, it's a quick
+	// short circuit still
+	if feed == nil {
+		return nil
+	}
+
+	current, ok := s.last[feed.Title]
+	if !ok {
+		s.last[feed.Title] = time.Time{}
+	}
+
+	// Catch older posts
+	// Timestamps here can be empty, which will fatal the service
+	// So we check for nil, then skip anything older than our last timestamp
+	if feed.PublishedParsed != nil && current.After(*feed.PublishedParsed) {
+		if feed.UpdatedParsed == nil {
+			return nil
+		}
+
+		// Feed updated before our last check, skip
+		if current.After(*feed.UpdatedParsed) {
+			return nil
+		}
+	}
+
+	// Total Drama Island was a sorta weird show
+	// I think I watched it enough with my son to say
+	// it really wasn't good. It was just silly for silly's sake.
+	// Compared to kids shows like, Teen Titans: Go! which have
+	// incredibly creative writers, talented voice actors, and
+	// skilled animators it just seems like timeslot filler.
+	for _, item := range feed.Items {
+		if item.PublishedParsed.Before(current) {
+			if item.UpdatedParsed.Before(current) {
+				continue
+			}
+		}
+
+		mw, err := s.ctrl.MainWriter("main", "feed")
+		if err != nil {
+			return err
+		}
+
+		fmt.Fprintf(mw, "[%s](%s)\n", item.Title, item.Link)
+		mw.Close()
+
+		// Add a time to our map for the item
+		s.last[feed.Title] = time.Now()
+	}
+
+	return nil
+}
+
+func listen(s *server, ew io.Writer, timeout int) error {
 	ctx := s.ctrl.Context()
 
 	// Break into functions
@@ -102,7 +178,7 @@ func listen(s *server, ew io.Writer, p *gofeed.Parser, timeout int) error {
 			log.Fatal(err)
 		}
 
-		for feed := range listNewFeeds(ctx, bufio.NewReader(fp), ew) {
+		for feed := range listNewFeeds(ctx, bufio.NewReader(fp), ew, timeout) {
 			if e := s.writeFeeds(feed); e != nil {
 				return e
 			}
